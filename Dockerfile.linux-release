@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1
+
+FROM node:24-bookworm AS toolchain
+
+ARG BUN_VERSION=1.4.0
+ENV DEBIAN_FRONTEND=noninteractive \
+    CODEX_WEB_GPT_LINUX_LIBNOTIFY=/workspace/launcher/build/linux-libs/libnotify.so.4
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      binutils \
+      build-essential \
+      ca-certificates \
+      curl \
+      file \
+      libasound2 \
+      libatk-bridge2.0-0 \
+      libatk1.0-0 \
+      libcairo2 \
+      libcups2 \
+      libdrm2 \
+      libgbm1 \
+      libgdk-pixbuf-2.0-dev \
+      libglib2.0-dev \
+      libgtk-3-0 \
+      libnspr4 \
+      libnss3 \
+      libpango-1.0-0 \
+      libx11-6 \
+      libxcb1 \
+      libxcomposite1 \
+      libxdamage1 \
+      libxext6 \
+      libxfixes3 \
+      libxkbcommon0 \
+      libxrandr2 \
+      meson \
+      ninja-build \
+      pkg-config \
+      squashfs-tools \
+      xauth \
+      xz-utils \
+      xvfb \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global "bun@${BUN_VERSION}"
+
+WORKDIR /workspace
+COPY package.json bun.lock ./
+COPY launcher/package.json launcher/bun.lock ./launcher/
+
+RUN bun install --frozen-lockfile \
+    && cd launcher \
+    && bun install --frozen-lockfile
+
+COPY . .
+
+# Windows checkouts may send CRLF shell scripts into the Linux build context.
+# Normalize the container copy only; the host working tree remains untouched.
+RUN find scripts launcher -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
+
+RUN ./scripts/prepare-linux-libnotify.sh \
+    && bun run launcher/scripts/prepare-linux-appimage-tools.cjs
+
+ENV APPIMAGE_TOOLS_PATH=/workspace/launcher/build/appimage-tools
+
+FROM toolchain AS package
+
+ARG RUN_FULL_VERIFY=1
+
+RUN if [ "$RUN_FULL_VERIFY" = "1" ]; then \
+      bun run verify; \
+    else \
+      bun run check-version && bun run audit && bun run launcher:audit; \
+    fi \
+    && bun run app:package \
+    && cd launcher/artifacts \
+    && sha256sum ./*.AppImage > SHA256SUMS
+
+FROM package AS build
+
+ARG APPIMAGE_EXTRACT_MODE=self
+
+RUN if [ "$APPIMAGE_EXTRACT_MODE" = "unsquashfs" ]; then \
+      APPIMAGE_PATH="$(find launcher/artifacts -maxdepth 1 -type f -name '*.AppImage' -print -quit)"; \
+      test -n "$APPIMAGE_PATH"; \
+      CODEX_WEB_GPT_APPIMAGE_EXTRACT_MODE=unsquashfs \
+        ./launcher/scripts/smoke-linux-appimage-symbols.sh "/workspace/$APPIMAGE_PATH"; \
+      printf 'PACKAGED_LAUNCHER_STRUCTURE_SMOKE_OK linux/%s\n' "$(uname -m)"; \
+    else \
+      bun run app:smoke; \
+    fi
+
+FROM scratch AS export
+COPY --from=build /workspace/launcher/artifacts/ /
+
+FROM scratch AS package-export
+COPY --from=package /workspace/launcher/artifacts/ /
